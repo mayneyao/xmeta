@@ -202,6 +202,10 @@ these functions and directory support are available.
    General scans first enumerate the whole directory tree and collect entry
    stats in memory. `LIMIT` bounds returned rows, not this initial enumeration.
    Equality lookups on `_id`, `id`, or `path` can resolve an entry directly.
+   Supported system-column ordering is performed on these fresh stats, before
+   projecting attachments or custom properties. SQLite retains residual
+   filtering and pagination; property sorts and unsupported ordering use its
+   normal sorter. No results are cached between queries.
 2. **`UPDATE`** reads the existing JSON envelope, merges new values, and writes it
    back to xattr/ADS. Setting a custom column to SQL `NULL` removes its key.
 3. **`DELETE`** clears this namespace's metadata without affecting file contents or

@@ -14,6 +14,39 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::path::PathBuf;
 use std::slice;
 
+// Only system columns whose exact SQLite values are already in FileInfo.
+// SQLite supplies aOrderBy only for the declared (BINARY) collation and the
+// default NULL ordering. Expressions, other collations and reversed NULL
+// placement stay with SQLite, as do custom property and attachment sorts.
+fn compare_system_column(a: &FileInfo, b: &FileInfo, column: usize) -> std::cmp::Ordering {
+    match column {
+        COL__ID | COL_ID | COL_PATH => a.rel_path.cmp(&b.rel_path),
+        COL_NAME => a.filename.cmp(&b.filename),
+        COL_EXTENSION => a.extension.cmp(&b.extension),
+        COL_SIZE => (a.size as i64).cmp(&(b.size as i64)),
+        COL__CREATED_AT => a.created_at_iso.cmp(&b.created_at_iso),
+        COL__UPDATED_AT | COL_MTIME => a.mtime_iso.cmp(&b.mtime_iso),
+        COL_IS_DIR => a.is_dir.cmp(&b.is_dir),
+        _ => unreachable!("unsupported system sort column"),
+    }
+}
+
+fn supports_system_sort(column: c_int) -> bool {
+    matches!(
+        column as usize,
+        COL__ID
+            | COL_ID
+            | COL_PATH
+            | COL_NAME
+            | COL_EXTENSION
+            | COL_SIZE
+            | COL__CREATED_AT
+            | COL__UPDATED_AT
+            | COL_MTIME
+            | COL_IS_DIR
+    )
+}
+
 // database_list also handles attached databases: argv[1] names the schema that
 // owns this virtual table, which need not be main.
 unsafe fn database_directory(db: *mut sqlite3, schema: &str) -> Result<Option<PathBuf>, String> {
@@ -204,6 +237,7 @@ pub struct FsMetaVTab {
 pub struct FsMetaCursor {
     pub base: sqlite3_vtab_cursor,
     pub rows: Vec<FileInfo>,
+    pub rowids: Vec<i64>,
     pub current_idx: usize,
     pub cached_meta: Option<HashMap<String, serde_json::Value>>,
     pub cached_meta_idx: usize,
@@ -348,6 +382,24 @@ unsafe extern "C" fn vtab_best_index(
         info.estimatedRows = 100;
     }
 
+    if info.nOrderBy > 0 {
+        let order = slice::from_raw_parts(info.aOrderBy, info.nOrderBy as usize);
+        if order.iter().all(|term| supports_system_sort(term.iColumn)) {
+            let terms: Vec<(usize, bool)> = order
+                .iter()
+                .map(|term| (term.iColumn as usize, term.desc != 0))
+                .collect();
+            let Ok(allocation) =
+                sqlite_loadable::api::mprintf(&serde_json::to_string(&terms).unwrap())
+            else {
+                return 7; // SQLITE_NOMEM
+            };
+            info.idxStr = allocation;
+            info.needToFreeIdxStr = 1;
+            info.orderByConsumed = 1;
+        }
+    }
+
     SQLITE_OK as c_int
 }
 
@@ -360,6 +412,7 @@ unsafe extern "C" fn vtab_open(
             pVtab: std::ptr::null_mut(),
         },
         rows: Vec::new(),
+        rowids: Vec::new(),
         current_idx: 0,
         cached_meta: None,
         cached_meta_idx: usize::MAX,
@@ -378,7 +431,7 @@ unsafe extern "C" fn vtab_close(p_cursor: *mut sqlite3_vtab_cursor) -> c_int {
 unsafe extern "C" fn vtab_filter(
     p_cursor: *mut sqlite3_vtab_cursor,
     idx_num: c_int,
-    _idx_str: *const c_char,
+    idx_str: *const c_char,
     argc: c_int,
     argv: *mut *mut sqlite3_value,
 ) -> c_int {
@@ -386,6 +439,7 @@ unsafe extern "C" fn vtab_filter(
     let vtab = &mut *((*p_cursor).pVtab as *mut FsMetaVTab);
 
     cursor.rows.clear();
+    cursor.rowids.clear();
     cursor.current_idx = 0;
     cursor.cached_meta = None;
     cursor.cached_meta_idx = usize::MAX;
@@ -401,6 +455,31 @@ unsafe extern "C" fn vtab_filter(
     } else {
         // Full directory scan
         cursor.rows = scan_directory(&vtab.config.root, &vtab.config.ignore_patterns);
+    }
+
+    if !idx_str.is_null() {
+        let terms: Vec<(usize, bool)> =
+            serde_json::from_slice(CStr::from_ptr(idx_str).to_bytes()).unwrap();
+        // A stable sort retains enumeration order for equal keys. Do not apply
+        // LIMIT/OFFSET here: SQLite must still evaluate every residual filter.
+        let mut indexed: Vec<_> = cursor.rows.drain(..).enumerate().collect();
+        indexed.sort_by(|(_, a), (_, b)| {
+            for &(column, descending) in &terms {
+                let ordering = compare_system_column(a, b, column);
+                if !ordering.is_eq() {
+                    return if descending {
+                        ordering.reverse()
+                    } else {
+                        ordering
+                    };
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+        for (original_index, file) in indexed {
+            cursor.rowids.push((original_index + 1) as i64);
+            cursor.rows.push(file);
+        }
     }
 
     SQLITE_OK as c_int
@@ -539,7 +618,11 @@ unsafe extern "C" fn vtab_column(
 
 unsafe extern "C" fn vtab_rowid(p_cursor: *mut sqlite3_vtab_cursor, p_rowid: *mut i64) -> c_int {
     let cursor = &*(p_cursor as *mut FsMetaCursor);
-    *p_rowid = (cursor.current_idx + 1) as i64;
+    *p_rowid = cursor
+        .rowids
+        .get(cursor.current_idx)
+        .copied()
+        .unwrap_or((cursor.current_idx + 1) as i64);
     SQLITE_OK as c_int
 }
 
