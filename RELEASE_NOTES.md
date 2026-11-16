@@ -1,4 +1,4 @@
-# xmeta 0.6.1
+# xmeta 0.6.2
 
 ## Improvements
 
