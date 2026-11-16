@@ -6,6 +6,138 @@ use std::sync::OnceLock;
 use tempfile::tempdir;
 
 #[test]
+fn utf16_system_order_uses_sqlite_encoding_with_exact_paged_results() {
+    for encoding in ["UTF-16le", "UTF-16be"] {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("entries");
+        fs::create_dir(&root).unwrap();
+        for (index, name) in [
+            "a.txt",
+            "中.txt",
+            "\u{10000}.txt",
+            "\u{e000}.txt",
+            "x.a",
+            "x.中",
+        ]
+        .iter()
+        .enumerate()
+        {
+            fs::write(root.join(name), vec![b'x'; index % 2]).unwrap();
+        }
+        fs::create_dir(root.join("sub")).unwrap();
+        fs::write(root.join("sub/a.txt"), b"").unwrap();
+        let setup = format!("PRAGMA encoding='{encoding}'; CREATE TABLE encoding_anchor(x); CREATE VIRTUAL TABLE files USING fs_meta(root={}, fields='rating INTEGER'); CREATE TEMP TABLE expected AS SELECT * FROM files;", sql_string(root.to_str().unwrap()));
+        let mut sql = setup.clone();
+        for order in [
+            "name ASC, _id ASC",
+            "name DESC, path ASC",
+            "size DESC, name ASC, _id DESC",
+            "extension ASC, _id ASC",
+            "_created_at DESC NULLS LAST, _id ASC",
+            "rating ASC NULLS FIRST, name ASC",
+            "rating DESC NULLS LAST, name DESC",
+        ] {
+            for filter in ["1", "size = 1", "rating IS NULL"] {
+                for offset in [0, 1, 4] {
+                    let values = "_id,name,path,extension,size,rating";
+                    sql += &format!("SELECT (SELECT json_group_array(json_array({values})) FROM (SELECT * FROM files WHERE {filter} ORDER BY {order} LIMIT 2 OFFSET {offset})) = (SELECT json_group_array(json_array({values})) FROM (SELECT * FROM expected WHERE {filter} ORDER BY {order} LIMIT 2 OFFSET {offset}));");
+                }
+            }
+        }
+        let database = temp.path().join("encoded.sqlite");
+        sql += "SELECT (SELECT json_group_array(json_array(id,label)) FROM (SELECT _id AS id,name AS label FROM files ORDER BY label ASC,id DESC LIMIT 3 OFFSET 1)) = (SELECT json_group_array(json_array(id,label)) FROM (SELECT _id AS id,name AS label FROM expected ORDER BY label ASC,id DESC LIMIT 3 OFFSET 1));";
+        let results = run_sqlite(temp.path(), &database, &sql);
+        assert!(
+            results.lines().all(|line| line == "1"),
+            "{encoding}: {results}"
+        );
+        assert_eq!(results.lines().count(), 7 * 3 * 3 + 1);
+        let plan = run_sqlite(
+            temp.path(),
+            &database,
+            "EXPLAIN QUERY PLAN SELECT * FROM files ORDER BY name ASC, _id ASC LIMIT 2 OFFSET 1;",
+        );
+        assert!(plan.contains("TEMP B-TREE"), "{encoding}: {plan}");
+    }
+}
+
+#[test]
+fn system_order_matches_sqlite_sort_with_filters_paging_and_stable_ids() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("files");
+    fs::create_dir(&root).unwrap();
+    for index in 0..160 {
+        let name = format!(
+            "{}-{:03}.{}",
+            ["Alpha", "alpha", "中文", "é"][index % 4],
+            index,
+            ["TXT", "md"][index % 2]
+        );
+        let file = root.join(name);
+        fs::write(&file, vec![b'x'; index % 13]).unwrap();
+        if index % 3 == 0 {
+            fs_meta::meta::write_metadata(
+                &file,
+                "space.eidos.test",
+                &std::collections::HashMap::from([
+                    ("rating".into(), serde_json::json!(index % 5)),
+                    ("tags".into(), serde_json::json!(["中文", "a"])),
+                ]),
+            )
+            .unwrap();
+        }
+    }
+    fs::create_dir(root.join("directory")).unwrap();
+    let setup = format!("CREATE VIRTUAL TABLE files USING fs_meta(root={}, namespace='space.eidos.test', fields='rating INTEGER, tags TEXT'); CREATE TEMP TABLE expected AS SELECT * FROM files;", sql_string(root.to_str().unwrap()));
+    let mut sql = setup;
+    for order in [
+        "_created_at DESC, _id ASC",
+        "size DESC, name ASC, _id DESC",
+        "extension ASC, path DESC",
+        "_updated_at DESC, _id ASC",
+        "is_dir DESC, name ASC",
+        "name COLLATE NOCASE ASC, _id ASC",
+        "_created_at ASC NULLS LAST, _id ASC",
+        "rating DESC, _id ASC",
+    ] {
+        for filter in ["1", "rating >= 2", "tags IS NULL AND size > 3"] {
+            for offset in [0, 80, 150] {
+                let values = "_id,name,size,_created_at,_updated_at,file,rating,tags";
+                sql += &format!("SELECT (SELECT json_group_array(json_array({values})) FROM (SELECT * FROM files WHERE {filter} ORDER BY {order} LIMIT 10 OFFSET {offset})) = (SELECT json_group_array(json_array({values})) FROM (SELECT * FROM expected WHERE {filter} ORDER BY {order} LIMIT 10 OFFSET {offset}));");
+            }
+        }
+    }
+    let result = run_sqlite(temp.path(), Path::new(":memory:"), &sql);
+    assert_eq!(result.lines().count(), 8 * 3 * 3);
+    assert!(result.lines().all(|line| line == "1"), "{result}");
+}
+
+#[test]
+fn system_order_avoids_sqlite_sort_but_unsupported_order_keeps_it() {
+    let temp = tempdir().unwrap();
+    fs::write(temp.path().join("a.txt"), "a").unwrap();
+    let setup = format!(
+        "CREATE VIRTUAL TABLE files USING fs_meta(root={}, fields='rating INTEGER');",
+        sql_string(temp.path().to_str().unwrap())
+    );
+    let plan = run_sqlite(temp.path(), Path::new(":memory:"), &format!("{setup} EXPLAIN QUERY PLAN SELECT * FROM files ORDER BY _created_at DESC NULLS LAST,_id ASC LIMIT 100 OFFSET 10;"));
+    assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+    for order in [
+        "name COLLATE NOCASE",
+        "_created_at ASC NULLS LAST",
+        "rating DESC",
+        "lower(name)",
+    ] {
+        let plan = run_sqlite(
+            temp.path(),
+            Path::new(":memory:"),
+            &format!("{setup} EXPLAIN QUERY PLAN SELECT * FROM files ORDER BY {order};"),
+        );
+        assert!(plan.contains("TEMP B-TREE"), "{plan}");
+    }
+}
+
+#[test]
 fn extension_reads_folder_schema_and_explicit_fields_still_override() {
     let temp = tempdir().unwrap();
     let root = temp.path().join("notes");
@@ -57,12 +189,16 @@ fn extension_library() -> &'static Path {
             .status()
             .expect("Failed to build test extension")
             .success());
-        let library = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
+        // Cargo may place test executables in nested build directories. Its
+        // reported target directory is stable across those layouts.
+        let metadata = Command::new(env!("CARGO"))
+            .args(["metadata", "--no-deps", "--format-version", "1"])
+            .output()
+            .expect("Could not locate Cargo target directory");
+        assert!(metadata.status.success());
+        let metadata: serde_json::Value = serde_json::from_slice(&metadata.stdout).unwrap();
+        let library = PathBuf::from(metadata["target_directory"].as_str().unwrap())
+            .join("debug")
             .join(format!(
                 "{}fs_meta{}",
                 std::env::consts::DLL_PREFIX,

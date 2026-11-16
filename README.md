@@ -190,6 +190,15 @@ on `id` can resolve a path directly. Result pagination does not make directory
 enumeration incremental, and sorting or aggregation may read metadata across
 the whole tree. No persistent index is created.
 
+Sorts on supported system columns (including creation time, name, size and
+path) run on the scanned entry stats before SQLite requests result properties.
+This avoids reading custom properties and formatting attachments for rows
+discarded by pagination. Custom-property sorts, expressions, non-default NULL
+placement and other collations continue through SQLite's sorter. Every query
+still scans fresh entries; no cross-query cache is retained.
+Non-UTF-8 databases also keep SQLite's sorter so BINARY ordering follows the
+database's text encoding exactly.
+
 Through the separate extension, `UPDATE` merges values into the file's JSON
 envelope and the default `DELETE` clears the namespace. `xmeta query` is read-only;
 use the CLI property commands for edits.
