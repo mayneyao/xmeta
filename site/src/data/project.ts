@@ -1,5 +1,5 @@
 export const repository = "https://github.com/mayneyao/xmeta";
-export const version = "0.6.0";
+export const version = "0.6.1";
 export const siteOrigin = "https://xmeta.eidos.space";
 export const docs = `${siteOrigin}/docs`;
 export const installCommand = "curl -fsSL https://xmeta.eidos.space/install.sh | sh";

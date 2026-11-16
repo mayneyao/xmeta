@@ -16,8 +16,8 @@ use std::slice;
 
 // Only system columns whose exact SQLite values are already in FileInfo.
 // SQLite supplies aOrderBy only for the declared (BINARY) collation and the
-// default NULL ordering. Expressions, other collations and reversed NULL
-// placement stay with SQLite, as do custom property and attachment sorts.
+// default NULL ordering. Rust text comparison matches BINARY only in UTF-8
+// databases, so other database encodings retain SQLite's sorter as well.
 fn compare_system_column(a: &FileInfo, b: &FileInfo, column: usize) -> std::cmp::Ordering {
     match column {
         COL__ID | COL_ID | COL_PATH => a.rel_path.cmp(&b.rel_path),
@@ -45,6 +45,28 @@ fn supports_system_sort(column: c_int) -> bool {
             | COL_MTIME
             | COL_IS_DIR
     )
+}
+
+unsafe fn database_uses_utf8(db: *mut sqlite3) -> bool {
+    let mut statement = std::ptr::null_mut();
+    if sqlite3ext_prepare_v2(
+        db,
+        c"PRAGMA encoding".as_ptr(),
+        -1,
+        &mut statement,
+        std::ptr::null_mut(),
+    ) != SQLITE_OK
+    {
+        return false;
+    }
+    let utf8 = if sqlite3ext_step(statement) == 100 {
+        let value = sqlite3ext_column_text(statement, 0);
+        !value.is_null() && CStr::from_ptr(value.cast()).to_bytes() == b"UTF-8"
+    } else {
+        false
+    };
+    sqlite3ext_finalize(statement);
+    utf8
 }
 
 // database_list also handles attached databases: argv[1] names the schema that
@@ -229,6 +251,7 @@ pub struct FsMetaVTab {
     pub base: sqlite3_vtab,
     pub config: VTabConfig,
     pub attachment_prefix: PathBuf,
+    database_uses_utf8: bool,
     journal: Vec<(PathBuf, Option<Vec<u8>>)>,
     savepoints: BTreeMap<c_int, usize>,
 }
@@ -322,6 +345,7 @@ unsafe extern "C" fn vtab_connect(
         },
         config,
         attachment_prefix,
+        database_uses_utf8: database_uses_utf8(db),
         journal: Vec::new(),
         savepoints: BTreeMap::new(),
     });
@@ -347,7 +371,7 @@ unsafe extern "C" fn vtab_destroy(p: *mut sqlite3_vtab) -> c_int {
 }
 
 unsafe extern "C" fn vtab_best_index(
-    _p_vtab: *mut sqlite3_vtab,
+    p_vtab: *mut sqlite3_vtab,
     p_idx_info: *mut sqlite3_index_info,
 ) -> c_int {
     let info = &mut *p_idx_info;
@@ -382,7 +406,7 @@ unsafe extern "C" fn vtab_best_index(
         info.estimatedRows = 100;
     }
 
-    if info.nOrderBy > 0 {
+    if (*(p_vtab as *const FsMetaVTab)).database_uses_utf8 && info.nOrderBy > 0 {
         let order = slice::from_raw_parts(info.aOrderBy, info.nOrderBy as usize);
         if order.iter().all(|term| supports_system_sort(term.iColumn)) {
             let terms: Vec<(usize, bool)> = order
@@ -890,6 +914,7 @@ mod tests {
             },
             config: VTabConfig::parse(&["root='.'".into()]).unwrap(),
             attachment_prefix: PathBuf::new(),
+            database_uses_utf8: true,
             journal: vec![
                 (file.clone(), Some(b"{\"rating\":4}".to_vec())),
                 (root.path().join("missing.txt"), Some(b"{}".to_vec())),

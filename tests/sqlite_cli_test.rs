@@ -6,6 +6,62 @@ use std::sync::OnceLock;
 use tempfile::tempdir;
 
 #[test]
+fn utf16_system_order_uses_sqlite_encoding_with_exact_paged_results() {
+    for encoding in ["UTF-16le", "UTF-16be"] {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("entries");
+        fs::create_dir(&root).unwrap();
+        for (index, name) in [
+            "a.txt",
+            "中.txt",
+            "\u{10000}.txt",
+            "\u{e000}.txt",
+            "x.a",
+            "x.中",
+        ]
+        .iter()
+        .enumerate()
+        {
+            fs::write(root.join(name), vec![b'x'; index % 2]).unwrap();
+        }
+        fs::create_dir(root.join("sub")).unwrap();
+        fs::write(root.join("sub/a.txt"), b"").unwrap();
+        let setup = format!("PRAGMA encoding='{encoding}'; CREATE TABLE encoding_anchor(x); CREATE VIRTUAL TABLE files USING fs_meta(root={}, fields='rating INTEGER'); CREATE TEMP TABLE expected AS SELECT * FROM files;", sql_string(root.to_str().unwrap()));
+        let mut sql = setup.clone();
+        for order in [
+            "name ASC, _id ASC",
+            "name DESC, path ASC",
+            "size DESC, name ASC, _id DESC",
+            "extension ASC, _id ASC",
+            "_created_at DESC NULLS LAST, _id ASC",
+            "rating ASC NULLS FIRST, name ASC",
+            "rating DESC NULLS LAST, name DESC",
+        ] {
+            for filter in ["1", "size = 1", "rating IS NULL"] {
+                for offset in [0, 1, 4] {
+                    let values = "_id,name,path,extension,size,rating";
+                    sql += &format!("SELECT (SELECT json_group_array(json_array({values})) FROM (SELECT * FROM files WHERE {filter} ORDER BY {order} LIMIT 2 OFFSET {offset})) = (SELECT json_group_array(json_array({values})) FROM (SELECT * FROM expected WHERE {filter} ORDER BY {order} LIMIT 2 OFFSET {offset}));");
+                }
+            }
+        }
+        let database = temp.path().join("encoded.sqlite");
+        sql += "SELECT (SELECT json_group_array(json_array(id,label)) FROM (SELECT _id AS id,name AS label FROM files ORDER BY label ASC,id DESC LIMIT 3 OFFSET 1)) = (SELECT json_group_array(json_array(id,label)) FROM (SELECT _id AS id,name AS label FROM expected ORDER BY label ASC,id DESC LIMIT 3 OFFSET 1));";
+        let results = run_sqlite(temp.path(), &database, &sql);
+        assert!(
+            results.lines().all(|line| line == "1"),
+            "{encoding}: {results}"
+        );
+        assert_eq!(results.lines().count(), 7 * 3 * 3 + 1);
+        let plan = run_sqlite(
+            temp.path(),
+            &database,
+            "EXPLAIN QUERY PLAN SELECT * FROM files ORDER BY name ASC, _id ASC LIMIT 2 OFFSET 1;",
+        );
+        assert!(plan.contains("TEMP B-TREE"), "{encoding}: {plan}");
+    }
+}
+
+#[test]
 fn system_order_matches_sqlite_sort_with_filters_paging_and_stable_ids() {
     let temp = tempdir().unwrap();
     let root = temp.path().join("files");

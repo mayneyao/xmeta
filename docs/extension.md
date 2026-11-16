@@ -206,6 +206,7 @@ these functions and directory support are available.
    projecting attachments or custom properties. SQLite retains residual
    filtering and pagination; property sorts and unsupported ordering use its
    normal sorter. No results are cached between queries.
+   Non-UTF-8 databases retain SQLite sorting for encoding-correct BINARY order.
 2. **`UPDATE`** reads the existing JSON envelope, merges new values, and writes it
    back to xattr/ADS. Setting a custom column to SQL `NULL` removes its key.
 3. **`DELETE`** clears this namespace's metadata without affecting file contents or
