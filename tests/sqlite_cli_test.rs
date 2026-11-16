@@ -189,12 +189,16 @@ fn extension_library() -> &'static Path {
             .status()
             .expect("Failed to build test extension")
             .success());
-        let library = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
+        // Cargo may place test executables in nested build directories. Its
+        // reported target directory is stable across those layouts.
+        let metadata = Command::new(env!("CARGO"))
+            .args(["metadata", "--no-deps", "--format-version", "1"])
+            .output()
+            .expect("Could not locate Cargo target directory");
+        assert!(metadata.status.success());
+        let metadata: serde_json::Value = serde_json::from_slice(&metadata.stdout).unwrap();
+        let library = PathBuf::from(metadata["target_directory"].as_str().unwrap())
+            .join("debug")
             .join(format!(
                 "{}fs_meta{}",
                 std::env::consts::DLL_PREFIX,
