@@ -22,6 +22,8 @@ fn compare_system_column(a: &FileInfo, b: &FileInfo, column: usize) -> std::cmp:
     match column {
         COL__ID | COL_ID | COL_PATH => a.rel_path.cmp(&b.rel_path),
         COL_NAME => a.filename.cmp(&b.filename),
+        // Missing extensions are stored as an empty string in FileInfo and
+        // exposed as SQL NULL. Both sort before nonempty text in ascending order.
         COL_EXTENSION => a.extension.cmp(&b.extension),
         COL_SIZE => (a.size as i64).cmp(&(b.size as i64)),
         COL__CREATED_AT => a.created_at_iso.cmp(&b.created_at_iso),
@@ -547,6 +549,7 @@ unsafe extern "C" fn vtab_column(
         COL_NAME => {
             let _ = result_text(ctx, &file.filename);
         }
+        COL_EXTENSION if file.extension.is_empty() => result_null(ctx),
         COL_EXTENSION => {
             let _ = result_text(ctx, &file.extension);
         }

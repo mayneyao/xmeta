@@ -367,6 +367,44 @@ SELECT instr(fs_meta_capabilities(), 'directory-properties') > 0;
 }
 
 #[test]
+fn missing_extensions_are_null_and_follow_sqlite_null_ordering() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("files");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(root.join("Folder")).unwrap();
+    fs::create_dir(root.join("Folder.dotted")).unwrap();
+    fs::write(root.join("README"), b"").unwrap();
+    fs::write(root.join("empty.TXT"), b"").unwrap();
+    let root = sql_string(root.to_str().unwrap());
+    let sql = format!(
+        r#"
+CREATE VIRTUAL TABLE files USING fs_meta(root={root});
+SELECT id FROM files WHERE extension IS NULL ORDER BY id;
+SELECT id, extension FROM files WHERE extension IS NOT NULL ORDER BY id;
+SELECT id FROM files ORDER BY extension ASC, id ASC LIMIT 2;
+SELECT id FROM files ORDER BY extension DESC, id DESC LIMIT 2;
+SELECT id FROM files ORDER BY extension ASC NULLS LAST, id ASC LIMIT 2;
+"#
+    );
+    let result = run_sqlite(temp.path(), Path::new(":memory:"), &sql);
+    assert_eq!(
+        result.lines().collect::<Vec<_>>(),
+        [
+            "Folder",
+            "Folder.dotted",
+            "README",
+            "empty.TXT|txt",
+            "Folder",
+            "Folder.dotted",
+            "empty.TXT",
+            "README",
+            "empty.TXT",
+            "Folder",
+        ]
+    );
+}
+
+#[test]
 fn directories_are_queryable_and_metadata_changes_roll_back() {
     let temp = tempdir().unwrap();
     let directory = temp.path().join("project.v1");
