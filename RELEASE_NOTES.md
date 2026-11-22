@@ -1,8 +1,8 @@
-# xmeta 0.6.2
+# xmeta 0.6.3
 
-## Improvements
+## Fixes
 
-- Make sorted, paged queries faster for large folders. Ordering by supported system columns, such as creation time, name, size and path, now happens before loading custom properties or building attachment values for rows outside the result page.
-- Keep exact filtering, ordering and pagination. Custom-property sorts, expressions, alternate collations, non-default NULL placement and non-UTF-8 databases continue to use SQLite's sorter.
+- Return SQL `NULL` in the `extension` column for directories and files without a suffix, so `extension IS NULL` finds both when filtering a folder table.
+- Preserve SQLite's NULL ordering for sorted and paginated results.
 
-Every query still reads the current filesystem. No persistent index or cross-query cache is created, and existing properties and folder schemas require no migration.
+Queries that matched an empty extension with `extension = ''` should use `extension IS NULL`. Existing properties and folder schemas require no migration.
